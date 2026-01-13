@@ -1,62 +1,24 @@
-use std::any::Any;
 use std::sync::Arc;
-use async_trait::async_trait;
-use chrono::prelude::*;
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+use chrono::NaiveDate;
+use datafusion::arrow::array::{
+    Array, ArrayRef, Float64Array, ListArray, TimestampNanosecondArray, GenericListArray,
+};
+use datafusion::arrow::buffer::OffsetBuffer;
+use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::{create_udaf, Accumulator, AggregateUDF, Signature, Volatility};
-use datafusion::physical_plan::expressions::format_state_name;
+use datafusion::logical_expr::{create_udaf, Accumulator, AggregateUDF, Volatility};
+use datafusion::logical_expr::function::AccumulatorArgs;
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use jiff::civil::Date;
 
 /// Represents a cash flow with an amount and a date.
 #[derive(Debug, Clone, Copy)]
 struct CashFlow {
     amount: f64,
-    date_ns: i64,
-}
-
-/// Calculates the net present value (NPV) of a series of cash flows for a given rate.
-fn npv(rate: f64, cash_flows: &[CashFlow]) -> f64 {
-    let first_date_ns = cash_flows[0].date_ns;
-    cash_flows.iter().map(|cf| {
-        let years = (cf.date_ns - first_date_ns) as f64 / (365.0 * 24.0 * 60.0 * 60.0 * 1_000_000_000.0);
-        cf.amount / (1.0 + rate).powf(years)
-    }).sum()
-}
-
-/// Calculates the derivative of the NPV with respect to the rate.
-fn d_npv(rate: f64, cash_flows: &[CashFlow]) -> f64 {
-    let first_date_ns = cash_flows[0].date_ns;
-    cash_flows.iter().map(|cf| {
-        let years = (cf.date_ns - first_date_ns) as f64 / (365.0 * 24.0 * 60.0 * 60.0 * 1_000_000_000.0);
-        -years * cf.amount / (1.0 + rate).powf(years + 1.0)
-    }).sum()
-}
-
-
-/// Calculates the XIRR using the Newton-Raphson method.
-fn calculate_xirr(cash_flows: &[CashFlow]) -> Option<f64> {
-    if cash_flows.len() < 2 {
-        return None;
-    }
-
-    let mut guess = 0.1; // Initial guess
-    for _ in 0..100 { // Max 100 iterations
-        let npv_val = npv(guess, cash_flows);
-        let d_npv_val = d_npv(guess, cash_flows);
-        if d_npv_val.abs() < 1e-9 { // Avoid division by zero
-            break;
-        }
-        let new_guess = guess - npv_val / d_npv_val;
-        if (new_guess - guess).abs() < 1e-9 { // Convergence
-            return Some(new_guess);
-        }
-        guess = new_guess;
-    }
-    None
+    date: Date,
 }
 
 /// XIRR Accumulator
@@ -66,19 +28,45 @@ struct XirrAccumulator {
 }
 
 impl Accumulator for XirrAccumulator {
-    fn state(&self) -> Result<Vec<ScalarValue>> {
-        let amounts = self.cash_flows.iter().map(|cf| ScalarValue::Float64(Some(cf.amount))).collect::<Vec<_>>();
-        let dates = self.cash_flows.iter().map(|cf| ScalarValue::Int64(Some(cf.date_ns))).collect::<Vec<_>>();
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let amounts: Vec<Option<f64>> = self.cash_flows.iter().map(|cf| Some(cf.amount)).collect();
+        let dates: Vec<Option<i64>> = self
+            .cash_flows
+            .iter()
+            .map(|cf| {
+                let zdt = cf.date.to_zoned(jiff::tz::TimeZone::UTC).unwrap();
+                Some(zdt.timestamp().as_second() * 1_000_000_000 + zdt.nanosecond() as i64)
+            })
+            .collect();
+
+        let amount_array = Arc::new(Float64Array::from(amounts)) as ArrayRef;
+        let date_array = Arc::new(TimestampNanosecondArray::from(dates)) as ArrayRef;
+
+        let amount_list = Arc::new(GenericListArray::<i32>::new(
+            Arc::new(Field::new("item", DataType::Float64, true)),
+            OffsetBuffer::from_lengths([amount_array.len()]),
+            amount_array,
+            None,
+        ));
+
+        let date_list = Arc::new(GenericListArray::<i32>::new(
+            Arc::new(Field::new("item", DataType::Timestamp(TimeUnit::Nanosecond, None), true)),
+            OffsetBuffer::from_lengths([date_array.len()]),
+            date_array,
+            None,
+        ));
 
         Ok(vec![
-            ScalarValue::List(Some(amounts), Arc::new(Field::new("item", DataType::Float64, true))),
-            ScalarValue::List(Some(dates), Arc::new(Field::new("item", DataType::Int64, true))),
+            ScalarValue::List(amount_list),
+            ScalarValue::List(date_list),
         ])
     }
 
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         if values.len() != 2 {
-            return Err(DataFusionError::Execution("XIRR expects two arguments: amounts and dates".to_string()));
+            return Err(DataFusionError::Execution(
+                "XIRR expects two arguments: amounts and dates".to_string(),
+            ));
         }
 
         let amounts = values[0].as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Execution("Expected Float64 for amounts".to_string()))?;
@@ -86,64 +74,104 @@ impl Accumulator for XirrAccumulator {
 
         for i in 0..amounts.len() {
             if amounts.is_valid(i) && dates.is_valid(i) {
+                let ts = jiff::Timestamp::from_nanosecond(dates.value(i) as i128).unwrap();
+                let zoned = jiff::Zoned::new(ts, jiff::tz::TimeZone::UTC);
                 self.cash_flows.push(CashFlow {
                     amount: amounts.value(i),
-                    date_ns: dates.value(i),
+                    date: zoned.date(),
                 });
             }
         }
-        self.cash_flows.sort_by_key(|cf| cf.date_ns);
+        self.cash_flows.sort_by_key(|cf| cf.date);
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         if states.len() != 2 {
-             return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Internal(format!(
                 "XIRR merge expects two arguments, got {}",
                 states.len()
             )));
         }
-        let amounts_list = states[0].as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Internal("Could not downcast amounts in merge".to_string()))?;
-        let dates_list = states[1].as_any().downcast_ref::<Int64Array>().ok_or_else(|| DataFusionError::Internal("Could not downcast dates in merge".to_string()))?;
+
+        let amounts_list = states[0].as_any().downcast_ref::<ListArray>().ok_or_else(|| DataFusionError::Internal("Could not downcast amounts in merge".to_string()))?;
+        let dates_list = states[1].as_any().downcast_ref::<ListArray>().ok_or_else(|| DataFusionError::Internal("Could not downcast dates in merge".to_string()))?;
 
         for i in 0..amounts_list.len() {
-             if amounts_list.is_valid(i) && dates_list.is_valid(i) {
-                self.cash_flows.push(CashFlow {
-                    amount: amounts_list.value(i),
-                    date_ns: dates_list.value(i),
-                });
+            let amounts = amounts_list.value(i);
+            let dates = dates_list.value(i);
+
+            let amounts = amounts.as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Internal("Could not downcast amounts from list".to_string()))?;
+            let dates = dates.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| DataFusionError::Internal("Could not downcast dates from list".to_string()))?;
+
+            for j in 0..amounts.len() {
+                if amounts.is_valid(j) && dates.is_valid(j) {
+                    let ts = jiff::Timestamp::from_nanosecond(dates.value(j) as i128).unwrap();
+                    let zoned = jiff::Zoned::new(ts, jiff::tz::TimeZone::UTC);
+                    self.cash_flows.push(CashFlow {
+                        amount: amounts.value(j),
+                        date: zoned.date(),
+                    });
+                }
             }
         }
-        self.cash_flows.sort_by_key(|cf| cf.date_ns);
+        self.cash_flows.sort_by_key(|cf| cf.date);
         Ok(())
     }
 
-    fn evaluate(&self) -> Result<ScalarValue> {
-        match calculate_xirr(&self.cash_flows) {
-            Some(rate) => Ok(ScalarValue::Float64(Some(rate))),
-            None => Ok(ScalarValue::Float64(None)),
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        if self.cash_flows.len() < 2 {
+            return Ok(ScalarValue::Float64(None));
+        }
+
+        let payments = self
+            .cash_flows
+            .iter()
+            .map(|cf| xirr::Payment {
+                amount: cf.amount,
+                date: cf.date,
+            })
+            .collect::<Vec<_>>();
+
+        let rate = xirr::compute(&payments);
+
+        match rate {
+            Ok(rate) => Ok(ScalarValue::Float64(Some(rate))),
+            Err(_) => Ok(ScalarValue::Float64(None)), // Or return an error
         }
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.cash_flows.capacity() * std::mem::size_of::<CashFlow>() - std::mem::size_of::<Self>()
+        std::mem::size_of_val(self)
+            + self.cash_flows.capacity() * std::mem::size_of::<CashFlow>()
+            - std::mem::size_of::<Self>()
     }
 }
 
 /// Creates the XIRR AggregateUDF
 fn create_xirr_udaf() -> AggregateUDF {
-    let accumulator_factory: Arc<dyn Fn() -> Result<Box<dyn Accumulator>> + Send + Sync> =
-        Arc::new(|| Ok(Box::new(XirrAccumulator::default())));
+    let accumulator_factory: Arc<dyn Fn(AccumulatorArgs) -> Result<Box<dyn Accumulator>> + Send + Sync> =
+        Arc::new(|_| Ok(Box::new(XirrAccumulator::default())));
+
+    let state_ty = Arc::new(vec![
+        DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ))),
+    ]);
 
     create_udaf(
         "xirr",
-        Signature::exact(vec![DataType::Float64, DataType::Timestamp(TimeUnit::Nanosecond, None)], Volatility::Immutable),
-        Arc::new(|_| Ok(Arc::new(DataType::Float64))),
+        vec![
+            DataType::Float64,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ],
+        Arc::new(DataType::Float64),
+        Volatility::Immutable,
         accumulator_factory,
-        Arc::new(vec![
-            Arc::new(Field::new("amounts", DataType::List(Arc::new(Field::new("item", DataType::Float64, true))), true)),
-            Arc::new(Field::new("dates", DataType::List(Arc::new(Field::new("item", DataType::Int64, true))), true)),
-        ])
+        state_ty,
     )
 }
 
@@ -159,11 +187,11 @@ async fn main() -> Result<()> {
     let user_ids = Arc::new(Float64Array::from(vec![1.0, 2.0, 1.0, 2.0, 1.0]));
     let amounts = Arc::new(Float64Array::from(vec![-100.0, -120.0, 20.0, 40.0, 110.0]));
     let dates = Arc::new(TimestampNanosecondArray::from(vec![
-        NaiveDate::from_ymd_opt(2025, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().timestamp_nanos(),
-        NaiveDate::from_ymd_opt(2025, 2, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().timestamp_nanos(),
-        NaiveDate::from_ymd_opt(2026, 3, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().timestamp_nanos(),
-        NaiveDate::from_ymd_opt(2027, 4, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().timestamp_nanos(),
-        NaiveDate::from_ymd_opt(2028, 5, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().timestamp_nanos(),
+        NaiveDate::from_ymd_opt(2025, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap(),
+        NaiveDate::from_ymd_opt(2025, 2, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap(),
+        NaiveDate::from_ymd_opt(2026, 3, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap(),
+        NaiveDate::from_ymd_opt(2027, 4, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap(),
+        NaiveDate::from_ymd_opt(2028, 5, 1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_nanos_opt().unwrap(),
     ]));
 
     let batch = RecordBatch::try_from_iter(vec![
@@ -175,7 +203,11 @@ async fn main() -> Result<()> {
     ctx.register_batch("transactions", batch)?;
 
     // 4. Execute a SQL query that groups by user_id and calculates the XIRR
-    let df = ctx.sql("SELECT user_id, xirr(amount, date) AS xirr FROM transactions GROUP BY user_id").await?;
+    let df = ctx
+        .sql(
+            "SELECT user_id, xirr(amount, date) AS xirr FROM transactions GROUP BY user_id",
+        )
+        .await?;
 
     // 5. Print the results
     df.show().await?;

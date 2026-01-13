@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arrow = "52.0.0"
 datafusion = "38.0.0"
 tokio = { version = "1", features = ["full"] }
-# iceberg-rust and arrow-adbc are not on crates.io at the time of writing.
-# You would typically add them from a git repository or a local path.
-# For this example, we will focus on the UDAF implementation and testing with in-memory data.
-# iceberg-rust = { git = "https://github.com/apache/iceberg-rust.git", rev = "<some-commit>" }
-# arrow-adbc = { git = "https://github.com/apache/arrow-adbc.git", rev = "<some-commit>" }
 futures = "0.3"
-chrono = "0.4"
+chrono = "0.4.31"
+async-trait = "0.1.80"
+xirr = "0.3.2"
+jiff = "0.2.18"
